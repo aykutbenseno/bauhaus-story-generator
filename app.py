@@ -82,7 +82,8 @@ st.caption(
     "Örnek: A=Ürün Kodu, B=Ürün Adı, C=Çizili, D=İndirimli, E=Link"
 )
 
-col_labels = ["A", "B", "C", "D", "E", "F", "G", "H"]
+col_labels      = ["A", "B", "C", "D", "E", "F", "G", "H"]
+col_labels_none = ["(yok)"] + col_labels
 
 cc1, cc2, cc3, cc4, cc5 = st.columns(5)
 with cc1:
@@ -95,6 +96,19 @@ with cc4:
     col_disc  = st.selectbox("İndirimli",    col_labels, index=3)
 with cc5:
     col_link  = st.selectbox("Ürün Linki",   col_labels, index=4)
+
+st.caption(
+    "**İpucu:** Görsel otomatik alınamıyorsa Sheets'e bir 'Görsel URL' sütunu ekle — "
+    "ürün sayfasındaki görsele sağ tıkla → 'Görsel adresini kopyala' → yapıştır."
+)
+cc6, _ = st.columns([1, 4])
+with cc6:
+    col_img_url = st.selectbox(
+        "Görsel URL (opsiyonel)",
+        col_labels_none,
+        index=0,
+        help="Scraper çalışmıyorsa direkt CDN linki için sütun seç. Yoksa '(yok)' bırak.",
+    )
 
 # ── Template reminder ─────────────────────────────────────────────────────────
 st.subheader("3. Template & Üretim")
@@ -142,11 +156,12 @@ if btn:
 
     # Map letter columns to 0-indexed positions
     col_idx = {
-        "code":  _col_to_idx(col_code),
-        "name":  _col_to_idx(col_name),
-        "orig":  _col_to_idx(col_orig),
-        "disc":  _col_to_idx(col_disc),
-        "link":  _col_to_idx(col_link),
+        "code":    _col_to_idx(col_code),
+        "name":    _col_to_idx(col_name),
+        "orig":    _col_to_idx(col_orig),
+        "disc":    _col_to_idx(col_disc),
+        "link":    _col_to_idx(col_link),
+        "img_url": _col_to_idx(col_img_url) if col_img_url != "(yok)" else None,
     }
 
     st.success(f"✅ {len(df)} ürün bulundu.")
@@ -168,6 +183,11 @@ if btn:
                 original_price = str(row[col_idx["orig"]]).strip()
                 disc_price     = str(row[col_idx["disc"]]).strip()
                 product_url    = str(row[col_idx["link"]]).strip()
+                img_url_direct = (
+                    str(row[col_idx["img_url"]]).strip()
+                    if col_idx["img_url"] is not None
+                    else None
+                )
             except IndexError:
                 errors_log.append(f"Satır {i+1}: sütun indeksi aralık dışı.")
                 continue
@@ -177,7 +197,10 @@ if btn:
             status_txt.caption(f"🔗 {product_url}")
 
             # Fetch product image
-            prod_img = scraper.fetch_product_image(product_url)
+            prod_img = scraper.fetch_product_image(
+                product_url,
+                direct_image_url=img_url_direct,
+            )
             if prod_img is None:
                 errors_log.append(
                     f"Satır {i+1} — **{product_name}**: görsel alınamadı, atlandı."
