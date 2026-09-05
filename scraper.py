@@ -1,28 +1,31 @@
 """
 BAUHAUS TR product image scraper.
 Strategy order:
-  0. Direct image URL (if caller already knows it — no HTTP request needed)
-  1. SAP Hybris OCC REST API  (less protected than HTML pages)
-  2. Open Graph meta tag
-  3. JSON-LD structured data
-  4. HTML selectors (BAUHAUS / SAP Commerce patterns)
-  5. Largest <img> fallback
-Uses cloudscraper to bypass Cloudflare JS challenges where possible.
+  0. Direct image URL (caller already has it — no HTTP)
+  1. SAP Hybris OCC REST API
+  2. Headless Chromium via Selenium (bypasses Cloudflare JS challenges)
+     → OG tag / JSON-LD / selectors / largest-img from rendered HTML
+  3. requests / cloudscraper fallback (same sub-strategies)
 """
 import io
 import json
 import re
+import shutil
+import time
+from pathlib import Path
+from urllib.parse import urlparse
 
 from PIL import Image
 
+# ── HTTP session (cloudscraper preferred) ────────────────────────────────────
 try:
     import cloudscraper
     _SESSION = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
 except Exception:
-    import requests as _requests
-    _SESSION = _requests.Session()
+    import requests as _req
+    _SESSION = _req.Session()
 
 HEADERS = {
     "User-Agent": (
@@ -38,132 +41,157 @@ HEADERS = {
 
 TIMEOUT = 25
 
+# ── Chromium locations (Streamlit Cloud / Ubuntu) ────────────────────────────
+_CHROMIUM_BINS = [
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/snap/bin/chromium",
+]
+_CHROMEDRIVER_BINS = [
+    "/usr/bin/chromedriver",
+    "/usr/lib/chromium-browser/chromedriver",
+    "/usr/lib/chromium/chromedriver",
+]
 
-def _get(url: str, as_json: bool = False):
-    """Fetch a URL. Returns response or None."""
-    headers = dict(HEADERS)
-    if as_json:
-        headers["Accept"] = "application/json"
-    try:
-        resp = _SESSION.get(url, headers=headers, timeout=TIMEOUT)
-        resp.raise_for_status()
-        return resp
-    except Exception as e:
-        print(f"[scraper] GET failed: {e}")
-        return None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_product_image(
     product_url: str,
     direct_image_url: str | None = None,
 ) -> Image.Image | None:
     """
-    Fetch the best product image.
+    Fetch the best product image for a BAUHAUS TR URL.
 
     Parameters
     ----------
     product_url       : BAUHAUS TR ürün sayfası URL'si
-    direct_image_url  : Kullanıcı tarafından sağlanan direkt CDN URL'si (opsiyonel).
-                        Varsa scrape atlanır, bu URL direkt indirilir.
+    direct_image_url  : Kullanıcı tarafından sağlanan direkt CDN linki (opsiyonel).
     """
-    # ── Strategy 0: caller already has the image URL ───────────────────────
-    if direct_image_url and direct_image_url.strip().startswith("http"):
+    # ── Strategy 0: caller already has the image URL ─────────────────────────
+    if direct_image_url and str(direct_image_url).strip().startswith("http"):
         img = _download(direct_image_url.strip())
         if img:
             return img
 
-    # ── Strategy 1: SAP Hybris OCC API ────────────────────────────────────
+    # ── Strategy 1: SAP Hybris OCC REST API ──────────────────────────────────
     product_code = _extract_product_code(product_url)
     if product_code:
         img = _try_hybris_api(product_code)
         if img:
             return img
 
-    # ── Fetch HTML (strategies 2-5) ────────────────────────────────────────
+    # ── Strategy 2: Headless Chromium (main Cloudflare bypass) ───────────────
+    html = _selenium_fetch_html(product_url)
+    if html:
+        img = _extract_from_html(html, product_url)
+        if img:
+            return img
+
+    # ── Strategy 3: requests / cloudscraper fallback ──────────────────────────
     resp = _get(product_url)
-    if resp is None:
-        print(f"[scraper] Page fetch failed for: {product_url}")
-        return None
-    html = resp.text
-
-    # Strategy 2: Open Graph
-    img_url = _og_image(html)
-    if img_url:
-        img = _download(img_url)
+    if resp:
+        img = _extract_from_html(resp.text, product_url)
         if img:
             return img
-
-    # Strategy 3: JSON-LD
-    img_url = _jsonld_image(html)
-    if img_url:
-        img = _download(img_url)
-        if img:
-            return img
-
-    # Strategy 4: BAUHAUS / SAP selectors
-    img_url = _html_selector(html)
-    if img_url:
-        img = _download(img_url)
-        if img:
-            return img
-
-    # Strategy 5: Largest img
-    img_url = _largest_img(html)
-    if img_url:
-        return _download(img_url)
 
     print(f"[scraper] All strategies exhausted: {product_url}")
     return None
 
 
-# ── Private helpers ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Selenium / headless Chromium
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_product_code(url: str) -> str | None:
-    """Extract product code from BAUHAUS TR URL. e.g. /p/61578160 → '61578160'"""
-    m = re.search(r'/p/(\d+)', url)
-    if m:
-        return m.group(1)
-    # Trailing digits fallback
-    m = re.search(r'/(\d{6,})(?:[/?#]|$)', url)
-    return m.group(1) if m else None
+def _selenium_fetch_html(url: str) -> str | None:
+    """
+    Open URL in headless Chromium, wait for JS (incl. Cloudflare challenge),
+    return final page source.  Returns None if selenium/chrome not available.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
 
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
 
-def _try_hybris_api(product_code: str) -> Image.Image | None:
-    """Try SAP Hybris OCC REST API to get product image URL."""
-    api_urls = [
-        f"https://www.bauhaus.com.tr/rest/v2/bauhaus/products/{product_code}?fields=images",
-        f"https://www.bauhaus.com.tr/api/products/{product_code}",
-    ]
-    for api_url in api_urls:
-        resp = _get(api_url, as_json=True)
-        if resp is None:
-            continue
+        # Locate Chromium binary
+        for binary in _CHROMIUM_BINS:
+            if Path(binary).exists():
+                opts.binary_location = binary
+                break
+
+        # Locate chromedriver
+        driver_bin = None
+        for dp in _CHROMEDRIVER_BINS:
+            if Path(dp).exists():
+                driver_bin = dp
+                break
+        if driver_bin is None:
+            driver_bin = shutil.which("chromedriver")
+        if driver_bin is None:
+            print("[scraper] chromedriver not found — selenium strategy skipped")
+            return None
+
+        service = Service(driver_bin)
+        driver = webdriver.Chrome(service=service, options=opts)
+
+        # Mask webdriver fingerprint
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
+        )
+
         try:
-            data = resp.json()
-            # SAP Hybris image format: [{format:'zoom', url:'...'}, ...]
-            images = data.get("images", [])
-            if not images and "data" in data:
-                images = data["data"].get("images", [])
-            # Prefer 'zoom' or 'product' format (highest quality)
-            for fmt in ("zoom", "product", "thumbnail"):
-                for img_data in images:
-                    if img_data.get("format") == fmt:
-                        url = img_data.get("url", "")
-                        if url:
-                            if url.startswith("/"):
-                                url = "https://www.bauhaus.com.tr" + url
-                            return _download(url)
-            # Fallback: first image in list
-            if images:
-                url = images[0].get("url", "")
-                if url:
-                    if url.startswith("/"):
-                        url = "https://www.bauhaus.com.tr" + url
-                    return _download(url)
-        except Exception as e:
-            print(f"[scraper] API parse error: {e}")
-            continue
+            driver.get(url)
+            time.sleep(5)   # wait for Cloudflare JS challenge to resolve
+            return driver.page_source
+        finally:
+            driver.quit()
+
+    except Exception as e:
+        print(f"[scraper] Selenium failed ({url}): {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML extraction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_from_html(html: str, base_url: str) -> Image.Image | None:
+    """Try OG → JSON-LD → selectors → largest-img from any HTML string."""
+    origin = _origin(base_url)
+    for fn in (_og_image, _jsonld_image, _html_selector, _largest_img):
+        img_url = fn(html)
+        if img_url:
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif img_url.startswith("/"):
+                img_url = origin + img_url
+            img = _download(img_url)
+            if img:
+                return img
     return None
+
+
+def _origin(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
 
 
 def _og_image(html: str) -> str | None:
@@ -214,13 +242,76 @@ def _html_selector(html: str) -> str | None:
 
 def _largest_img(html: str) -> str | None:
     candidates = re.findall(
-        r'<img[^>]+src=["\'](https?://[^"\']+\.(jpg|jpeg|png|webp))["\']',
+        r'<img[^>]+src=["\']((?:https?:)?//[^"\']+\.(jpg|jpeg|png|webp))["\']',
         html, re.IGNORECASE
     )
     for url, _ in candidates:
         if any(k in url.lower() for k in ("product", "urun", "medias", "images", "sys_master")):
             return url
     return candidates[0][0] if candidates else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAP Hybris OCC API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_product_code(url: str) -> str | None:
+    m = re.search(r'/p/(\d+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/(\d{6,})(?:[/?#]|$)', url)
+    return m.group(1) if m else None
+
+
+def _try_hybris_api(product_code: str) -> Image.Image | None:
+    api_urls = [
+        f"https://www.bauhaus.com.tr/rest/v2/bauhaus/products/{product_code}?fields=images",
+        f"https://www.bauhaus.com.tr/api/products/{product_code}",
+    ]
+    for api_url in api_urls:
+        resp = _get(api_url, as_json=True)
+        if resp is None:
+            continue
+        try:
+            data = resp.json()
+            images = data.get("images", [])
+            if not images and "data" in data:
+                images = data["data"].get("images", [])
+            for fmt in ("zoom", "product", "thumbnail"):
+                for img_data in images:
+                    if img_data.get("format") == fmt:
+                        img_url = img_data.get("url", "")
+                        if img_url:
+                            if img_url.startswith("/"):
+                                img_url = "https://www.bauhaus.com.tr" + img_url
+                            return _download(img_url)
+            if images:
+                img_url = images[0].get("url", "")
+                if img_url:
+                    if img_url.startswith("/"):
+                        img_url = "https://www.bauhaus.com.tr" + img_url
+                    return _download(img_url)
+        except Exception as e:
+            print(f"[scraper] API parse error: {e}")
+            continue
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get(url: str, as_json: bool = False):
+    headers = dict(HEADERS)
+    if as_json:
+        headers["Accept"] = "application/json"
+    try:
+        resp = _SESSION.get(url, headers=headers, timeout=TIMEOUT)
+        resp.raise_for_status()
+        return resp
+    except Exception as e:
+        print(f"[scraper] GET failed: {e}")
+        return None
 
 
 def _download(url: str) -> Image.Image | None:
