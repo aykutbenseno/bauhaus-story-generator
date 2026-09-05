@@ -1,12 +1,28 @@
 """
 BAUHAUS TR product image scraper.
-Tries multiple strategies in priority order to obtain the main product photo.
+Strategy order:
+  0. Direct image URL (if caller already knows it — no HTTP request needed)
+  1. SAP Hybris OCC REST API  (less protected than HTML pages)
+  2. Open Graph meta tag
+  3. JSON-LD structured data
+  4. HTML selectors (BAUHAUS / SAP Commerce patterns)
+  5. Largest <img> fallback
+Uses cloudscraper to bypass Cloudflare JS challenges where possible.
 """
 import io
 import json
 import re
-import requests
+
 from PIL import Image
+
+try:
+    import cloudscraper
+    _SESSION = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+except Exception:
+    import requests as _requests
+    _SESSION = _requests.Session()
 
 HEADERS = {
     "User-Agent": (
@@ -18,56 +34,137 @@ HEADERS = {
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.bauhaus.com.tr/",
-    "DNT": "1",
 }
 
-TIMEOUT = 20   # seconds
+TIMEOUT = 25
 
 
-def fetch_product_image(url: str) -> Image.Image | None:
-    """
-    Fetch the best product image from a BAUHAUS TR product URL.
-    Returns a PIL Image or None if all strategies fail.
-    """
+def _get(url: str, as_json: bool = False):
+    """Fetch a URL. Returns response or None."""
+    headers = dict(HEADERS)
+    if as_json:
+        headers["Accept"] = "application/json"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp = _SESSION.get(url, headers=headers, timeout=TIMEOUT)
         resp.raise_for_status()
-        html = resp.text
+        return resp
     except Exception as e:
-        print(f"[scraper] Page fetch failed: {e}")
+        print(f"[scraper] GET failed: {e}")
         return None
 
-    # Strategy 1 — Open Graph image (fastest, usually highest-quality)
+
+def fetch_product_image(
+    product_url: str,
+    direct_image_url: str | None = None,
+) -> Image.Image | None:
+    """
+    Fetch the best product image.
+
+    Parameters
+    ----------
+    product_url       : BAUHAUS TR ürün sayfası URL'si
+    direct_image_url  : Kullanıcı tarafından sağlanan direkt CDN URL'si (opsiyonel).
+                        Varsa scrape atlanır, bu URL direkt indirilir.
+    """
+    # ── Strategy 0: caller already has the image URL ───────────────────────
+    if direct_image_url and direct_image_url.strip().startswith("http"):
+        img = _download(direct_image_url.strip())
+        if img:
+            return img
+
+    # ── Strategy 1: SAP Hybris OCC API ────────────────────────────────────
+    product_code = _extract_product_code(product_url)
+    if product_code:
+        img = _try_hybris_api(product_code)
+        if img:
+            return img
+
+    # ── Fetch HTML (strategies 2-5) ────────────────────────────────────────
+    resp = _get(product_url)
+    if resp is None:
+        print(f"[scraper] Page fetch failed for: {product_url}")
+        return None
+    html = resp.text
+
+    # Strategy 2: Open Graph
     img_url = _og_image(html)
     if img_url:
         img = _download(img_url)
         if img:
             return img
 
-    # Strategy 2 — JSON-LD structured data
+    # Strategy 3: JSON-LD
     img_url = _jsonld_image(html)
     if img_url:
         img = _download(img_url)
         if img:
             return img
 
-    # Strategy 3 — BAUHAUS TR-specific HTML selectors
+    # Strategy 4: BAUHAUS / SAP selectors
     img_url = _html_selector(html)
     if img_url:
         img = _download(img_url)
         if img:
             return img
 
-    # Strategy 4 — Largest <img> on the page (last resort)
+    # Strategy 5: Largest img
     img_url = _largest_img(html)
     if img_url:
         return _download(img_url)
 
-    print(f"[scraper] All strategies exhausted for: {url}")
+    print(f"[scraper] All strategies exhausted: {product_url}")
     return None
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────
+
+def _extract_product_code(url: str) -> str | None:
+    """Extract product code from BAUHAUS TR URL. e.g. /p/61578160 → '61578160'"""
+    m = re.search(r'/p/(\d+)', url)
+    if m:
+        return m.group(1)
+    # Trailing digits fallback
+    m = re.search(r'/(\d{6,})(?:[/?#]|$)', url)
+    return m.group(1) if m else None
+
+
+def _try_hybris_api(product_code: str) -> Image.Image | None:
+    """Try SAP Hybris OCC REST API to get product image URL."""
+    api_urls = [
+        f"https://www.bauhaus.com.tr/rest/v2/bauhaus/products/{product_code}?fields=images",
+        f"https://www.bauhaus.com.tr/api/products/{product_code}",
+    ]
+    for api_url in api_urls:
+        resp = _get(api_url, as_json=True)
+        if resp is None:
+            continue
+        try:
+            data = resp.json()
+            # SAP Hybris image format: [{format:'zoom', url:'...'}, ...]
+            images = data.get("images", [])
+            if not images and "data" in data:
+                images = data["data"].get("images", [])
+            # Prefer 'zoom' or 'product' format (highest quality)
+            for fmt in ("zoom", "product", "thumbnail"):
+                for img_data in images:
+                    if img_data.get("format") == fmt:
+                        url = img_data.get("url", "")
+                        if url:
+                            if url.startswith("/"):
+                                url = "https://www.bauhaus.com.tr" + url
+                            return _download(url)
+            # Fallback: first image in list
+            if images:
+                url = images[0].get("url", "")
+                if url:
+                    if url.startswith("/"):
+                        url = "https://www.bauhaus.com.tr" + url
+                    return _download(url)
+        except Exception as e:
+            print(f"[scraper] API parse error: {e}")
+            continue
+    return None
+
 
 def _og_image(html: str) -> str | None:
     m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']', html)
@@ -99,16 +196,14 @@ def _jsonld_image(html: str) -> str | None:
 
 
 def _html_selector(html: str) -> str | None:
-    """Try BAUHAUS TR / SAP Commerce product image patterns."""
     patterns = [
-        # SAP Commerce (Hybris) — common at BAUHAUS
         r'<img[^>]+id=["\']zoom_\d*["\'][^>]+src=["\'](https?://[^"\']+)["\']',
         r'<img[^>]+class=["\'][^"\']*product[^"\']*primary[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)["\']',
         r'<img[^>]+class=["\'][^"\']*main-image[^"\']*["\'][^>]+src=["\'](https?://[^"\']+)["\']',
-        # Generic
         r'<img[^>]+id=["\']product[_-]?image["\'][^>]+src=["\'](https?://[^"\']+)["\']',
         r'data-zoom-image=["\'](https?://[^"\']+)["\']',
         r'data-main-image=["\'](https?://[^"\']+)["\']',
+        r'src=["\'](https?://[^"\']*(?:medias|sys_master)[^"\']+(?:jpg|jpeg|png|webp))["\']',
     ]
     for pat in patterns:
         m = re.search(pat, html, re.IGNORECASE)
@@ -118,26 +213,24 @@ def _html_selector(html: str) -> str | None:
 
 
 def _largest_img(html: str) -> str | None:
-    """Return the first large product-looking image src found."""
     candidates = re.findall(
         r'<img[^>]+src=["\'](https?://[^"\']+\.(jpg|jpeg|png|webp))["\']',
         html, re.IGNORECASE
     )
-    # Prefer URLs containing product-ish keywords
     for url, _ in candidates:
-        if any(k in url.lower() for k in ("product", "urun", "medias", "images")):
+        if any(k in url.lower() for k in ("product", "urun", "medias", "images", "sys_master")):
             return url
     return candidates[0][0] if candidates else None
 
 
 def _download(url: str) -> Image.Image | None:
-    """Download and open an image from a URL."""
     if url.startswith("//"):
         url = "https:" + url
+    resp = _get(url)
+    if resp is None:
+        return None
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
         return Image.open(io.BytesIO(resp.content))
     except Exception as e:
-        print(f"[scraper] Image download failed ({url}): {e}")
+        print(f"[scraper] Image open failed ({url}): {e}")
         return None
