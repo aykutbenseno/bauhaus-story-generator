@@ -14,6 +14,18 @@ from PIL import Image
 import generator
 import scraper
 
+
+# ── Helpers (tanımlı olmaları gerekiyor — dosyanın üstünde) ──────────────────
+
+def _extract_sheet_id(url: str) -> str | None:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", url)
+    return m.group(1) if m else None
+
+
+def _col_to_idx(letter: str) -> int:
+    return ord(letter.upper()) - ord("A")
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="BAUHAUS Story Generator",
@@ -151,11 +163,11 @@ if btn:
         for i, (_, row) in enumerate(df.iterrows()):
             row = row.tolist()
             try:
-                product_code  = str(row[col_idx["code"]]).strip()
-                product_name  = str(row[col_idx["name"]]).strip()
-                original_price= str(row[col_idx["orig"]]).strip()
-                disc_price    = str(row[col_idx["disc"]]).strip()
-                product_url   = str(row[col_idx["link"]]).strip()
+                product_code   = str(row[col_idx["code"]]).strip()
+                product_name   = str(row[col_idx["name"]]).strip()
+                original_price = str(row[col_idx["orig"]]).strip()
+                disc_price     = str(row[col_idx["disc"]]).strip()
+                product_url    = str(row[col_idx["link"]]).strip()
             except IndexError:
                 errors_log.append(f"Satır {i+1}: sütun indeksi aralık dışı.")
                 continue
@@ -219,14 +231,3 @@ if btn:
         use_container_width=True,
         type="primary",
     )
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _extract_sheet_id(url: str) -> str | None:
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", url)
-    return m.group(1) if m else None
-
-
-def _col_to_idx(letter: str) -> int:
-    return ord(letter.upper()) - ord("A")
